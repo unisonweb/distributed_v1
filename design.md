@@ -1,6 +1,6 @@
 # RFC: Unison distributed programming API
 
-_This document was written by Heather Miller and Paul Chiusano, but the ideas developed here are the work of many other contributors too, including Arya Irani, Rúnar Bjarnason, Chris Gibbs, and others. Thanks to everyone who has helped out in big and small ways!_
+_This document was written by Heather Miller and Paul Chiusano, but the ideas developed here are the work of many other contributors too, including Arya Irani, Rúnar Bjarnason, Chris Gibbs, Dan Doel, and others. Thanks to everyone who has helped out in big and small ways!_
 
 __Disclaimer: This document is a work in progress. Comments are welcome!__
 
