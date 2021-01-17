@@ -1,196 +1,285 @@
-*This is a design document that is a work in progress.* 
+# RFC: Unison distributed programming API
 
-An early intention of Unison was for it to facilitate the design and implementation of distributed applications. Unison intends to be a language that makes it easier to implement and reason about programs as diverse as protocol implementations, orchestrations of serverless computations, data-centric/MapReduce-style computations, and more.
+_This document was written by Heather Miller and Paul Chiusano, but the ideas developed here are the work of many other contributors too, including Arya Irani, Rúnar Bjarnason, Chris Gibbs, and others. Thanks to everyone who has helped out in big and small ways!_
 
-Importantly, as a programming language meant to be used to implement features of distributed applications, Unison attempts a useful separation of concerns for developers of distributed systems. An important design consideration is thus to allow the distributed system developer to reason about important aspects of distributed system development like communication patterns over the network, but without having to dip to lower levels of the OSI model. Distributed applications written in Unison are meant to sit at the presentation/application level of the OSI model, without having to dip lower. That is, no need to futz with sockets, no need to worry about networking layers, just focus on programming against remote resources or on the communication pattern that makes up a protocol.
+__Disclaimer: This document is a work in progress. Comments are welcome!__
 
-Unison Distributed is expected to consists of two prime components:
+This document describes a distributed programming API for Unison. The API is intended to be general purpose, capable of expressing protocol implementations, orchestrations of serverless computations, data-centric/MapReduce-style computations, and more. A goal is to support this generality without having to futz with sockets or worry about networking layers; the developer should get to focus on the essence of the distributed algorithm, data structure, or protocol being implemented, not on parsing or serialization or low-level networking.
 
-- *a Distributed API*, which includes abstractions useful for programming against multiple distributed nodes, or against data located on remote nodes.
-- *a Distributed Runtime*, which is a suite of utilities that run behind the scenes in distributed Unison programs, and which handle bookkeeping for the various abstractions.
+The API is given using [abilities](https://unisonweb.org/docs/abilities), which leaves it abstract and capable of being interpreted in different ways. The same program may be run locally on a single machine, or via a _distributed runtime_ that executes the program on distributed infrastructure.
 
-This document represents a snapshot of the ongoing process to design Unison's distributed programming facilities, and as such is liable to change.
+## Remote
 
-## APIs
+Unison's main API for writing distributed programs is the `Remote` ability, which supports forking parallel computations at different logical locations. Forking returns a handle to a running task, and `await t` blocks the current computation until the task `t` completes with its result. This is much the same as other asynchronous programming APIs, except that tasks now have a location. Here's the full API, which will be explained in more detail:
 
-### Remote
-
-Unison's main API for programming against a distributed resource is its `Remote` ability. The basic use case to consider using `Remote` for is for starting parallel tasks at different, remote, nodes in the cluster. 
-
-The main two workhorse functions on `Remote` are `forkAt` and/or `fork`. As its name indicates, `forkAt` allows the user to indicate where they would like the computation to take place, by providing a location `loc` as an argument, while `fork` is indiscriminate about *where* the computation takes place. 
-
-The notion of a *location* is discussed in more detail in the Distributed Runtime section of this document.
-
-The `Remote` ability also includes other useful functions for managing task-parallel computations. Those include `await`, `fail`, `cancel`, amongst others.
-
-Such an API is as follows:
-
-```haskell
-unique ability Remote loc task err g where
-  forkAt   : loc -> '{g, Remote loc task err g} a -> task a
-  fork     : '{g, Remote loc task err g} a -> task a
-  location : task a -> loc
+```Haskell
+unique ability Remote task g where
+  forkAt   : Location -> '{g, Remote task g} a -> task a
+  detachAt : Location -> '{g, Remote task g} a -> task a
+  location : task a -> Location
   await    : task a -> a
-  cancel   : err -> task a -> ()
-  fail     : err -> a
+  cancel   : Failure -> task a -> ()
+  fail     : Failure -> a
+  here     : Location
 ```
 
-The notion of an *error* is also discussed in more detail below.
+The `Remote` ability is parameterized on `task`, which is the representation of a running computation, and `g` which controls what abilities forked computations can access. For example:
 
-`Remote` can also be thought of as a distributed variant of `Async`. 
+* A computation `'{Remote task, {}} Nat` can only do pure computation
+* A computation `'{Remote task, Http.Client} ()` will have access to an `Http.Client` ability.
+* In theory, a '{Remote task, IO} a` could exist in which remote computations can do arbitrary `IO`, but in practice, on real distributed infrastructure, we'll use more restricted abilities than `IO`.
 
-In addition to task parallelism, Unison also aims to support straightforward data-centric programming against both stable and ephemeral remote data. 
-
-### Durable
-
-Stable remote data can be represented in Unison using the `Durable` ability. The more straightforward storage API, `Durable`s are what they sound like– remote data that is expected to always be reachable. 
-
-The API for the read and write portions of `Durable`s are as follows:
+The primary function that provides for distributed parallelism is `forkAt`, which starts a computation running at a (possibly remote) location. Here's an example usage:
 
 ```haskell
-unique ability Durable.W loc d where
-  save     : loc -> a -> d a
-  location : d a -> loc 
-
-unique ability Durable.R d where
-  restore : d a -> a
+-- Example program
+parallelAdd loc t1 t2 =
+  a = forkAt loc t1
+  b = forkAt loc t2
+  await a + await b
 ```
 
-Here, the notion of *location* once again comes up in the API. Importantly, as we will see in subsequent sections of this document, the notion of a location here can be either fine- or coarse-grained. That is, when `save` is called, the `loc` that is used could refer to either a specific compute node, or a logical group of compute nodes (such as a specific instance type in AWS's us-east-1 availability zone.)
+### Locations and location chaining
 
-What *should* happen regarding garbage collection for `Durable`s is not yet clear. If it is determined that some sort of GCing for `Durable`s should be possible, it might result in changes to this API.
+The `Location` type is just a GUID representing a logical location. These will be mapped to physical machines by the distributed runtime. Multiple `Location` values may map to the same physical machine, or a `Location` may refer to multiple physical machines. For instance, a `usEast : Location` might refer to an entire region, consisting of thousands of physical machines, and `forkAt usEast myTask` gives the distributed runtime the freedom to schedule `myTask` onto any available machine in that region.
 
-### Ephemeral
+Note that `forkAt` returns a `task` with possibly more fine-grained location information, which can be used to achieve better task locality and reduce communication. For instance, in this code:
 
-Conversely to the notion of a `Durable` is an `Ephemeral`. While a `Durable` is expected to always be reachable, an `Ephemeral` is not. `Ephemeral`s are meant to be used for intermediate remote data that is not important to cache or store long-term. 
-
-Similarly to the API for `Durable`s, the API for the read and write portions of `Ephemeral`s are as follows:
-
-```haskell
-unique ability Ephemeral.W d where
-  save     : loc -> a -> d a
-  location : d a -> loc
-
-unique ability Ephemeral.R d where
-  restore : d a -> a
+```Haskell
+t1 = forkAt usEast thing1
+t2 = forkAt usEast thing2
+merged = forkAt usEast '(merge (await t1) (await t2))
 ```
 
-Notably here is the notion of `restore` functionality. How could such a function make sense if `Ephemeral`s aren't guaranteed to be accessible at any given moment? One way is through a notion of a *lineage*. Like lineages in Spark, the idea here would be that all `Ephemeral`s must be derived from a `Durable`. This way, keeping track of chains of calls on `Ephemeral`s derived from `Durable`s would make something like a `restore` operation possible– an `Ephemeral` could simply be recomputed based on its backing `Durable`(s) and the cached operations that make up its lineage.
+The `t1`, `t2`, and `merged` tasks might all be scheduled onto different machines, leading to network communication when their results are being combined with `merge`. Instead, the programmer can request that tasks be forked _at the same location as other tasks_, like so:
 
-As one might expect, garbage collection for `Ephemeral`s is also an important concern. Unlike for `Durable`s, strategies for GCing remote `Ephemeral`s are more straightforward. For example, the most straightforward way of evicting `Ephemeral`s from memory might be through the use of an LRU cache. 
-
-## Available Models of Computation
-
-### Task Parallelism via Remote
-
-Task parallelism is an old and well-understood parallelization strategy. Unlike other forms of parallelism, task parallelism focuses on tasks (meaningful work) as the main unit to parallelize by "forking" that work and scheduling it on a worker of some kind. This is no different in Unison Distributed using the `Remote` ability. The basic idea is to use `fork` or `forkAt` to spawn a task on some node. Functions like `await` can be used to collect the result performed elsewhere.
-
-As we will see in the section on Examples later on in this document, task parallelism can be used to implement data-parallel interfaces. Contra to task parallelism, data parallelism focuses on data as the main unit to distribute and therefore parallelize. MapReduce-style or batch computing interfaces like RDDs in Spark are examples of data-parallel interfaces. Unison can be used to develop data-parallel libraries using a combination of `Remote`, `Durable`, and `Ephemeral`.
-
-### Message-passing layer
-
-Not all programs that one might wish to implement are task-centric or data-centric. Rather, the implementation of a distributed protocol is communication-centric, requiring explicit messaging and coordination, and task parallelism by way of the Remote ability likely does not suit this implementation use case well.
-
-For that reason, Unison will have a messaging layer that is accessible when needed, but which is generally discouraged. In an effort to remain in a world where communication between independent nodes remains typed, Unison's message-passing layer will be based on the notion of typed channels. These typed channels will be a lower-level API that the `Remote` ability can be handled into.
-
-```haskell
-unique ability Channel loc c where
-  channel    : loc -> c a
-  location   : c a -> loc
- 
-  -- Send a value to a channel; works anywhere. If the channel
-  -- resides on another node, will serialize the `a` and send it
-  -- over the network.
-  send       : a -> c a -> ()
-  
-  -- Like `send`, but don't wait for the value to be transferred
-  -- before returning.
-  sendUnconfirmed : a -> c a -> ()
-  
-  -- Receive a value from a channel; works anywhere. If the channel
-  -- resides on another node, the receive will happen on that node
-  -- and the result sent to the caller of `receive`.
-  receive    : c a -> a
-  
-  -- Like `receive` but leave the value in the channel.
-  peek       : c a -> a
-  
-  -- Like `receive`/`peek` but if the channel is currently empty,
-  -- returns `None` right away rather than blocking.
-  receiveNow : c a -> Optional a
-  peekNow    : c a -> Optional a
+```Haskell
+t1 = forkAt usEast thing1
+t2 = forkAt (location t1) thing2
+merged = forkAt (location t1) '(merge (await t1) (await t2))
 ```
 
-## Error Handling
+Here, `t2` and `merged` are both forked at the same location as `t1`, so no network communication happens to combine their results.
 
-One aspect that we found ourselves repeatedly returning to was the notion of error handling. When building and debugging a distributed system, useful error handling facilities are essential– having a well-designed notion of what sorts of errors can occur, and being able to explicitly deal with those common error cases can save countless hours of debugging and development time.
+<details><summary>
+The above API lets you be explicit about where tasks are forked. One idea that we have discussed is the notion of an *algebra of locations* that makes it possible to be less explicit about locations while still expressing interesting constraints.</summary>
 
-This requires us to zoom in on Unison's mechanisms for error handling– which don't yet exist.
+For instance, it might be desirable to be able to say things like `forkAt (somewhereNear bob) thing1`, or `forkAt (both (within usEast) (farFrom bob)) thing2` for a location that's in `usEast` but isn't on the same machine as the location `bob`. This sort of thing might be used to obtain locations whose failures will be less correlated than if they are on the same machine. We don't know if an algebra of locations would be too rich/flexible, effectively making it overkill, or not. This is an idea worth exploring further.
+</details>
 
-Importantly, our philosophy is to keep the notion of an error as generic as possible. For now, we believe the best way to achieve this is by keeping distribution-related errors generic at the level of the `Remote` ability and combinators. This way, APIs like the `Remote` ability and its combinators (e.g., `mapError`, `rescue`, `try`, and others), can leave it to library code built atop of `Remote` to be more opinionated about what exactly an error is, per application.
+### Error handling
 
-However, we can use a blanket strategy of allowing client libraries to exclusively decide what an error is. There also exist system-level errors (e.g., Out of Memory Errors) that need to be represented and catchable in the Unison runtime. The represents the need for something core to Unison to be introduced, like a notion of a `SystemError` or the like to be defined as part of Unison's (general, not distributed) runtime. This would enable client libraries to handle system-specific errors however is appropriate for a given application.
-
-*Note that this discussion of error-handling is still very much a work in progress. This discussion touches not just upon Unison Distributed, but Unison's core runtime as well.* 
-
-One possible definition of a generic Unison error type is:
+Tasks (especially remote tasks) can fail. We use a common failure type with runtime type tags so users can define new failure types:
 
 ```haskell
-unique type Error e
-  = User e
-  | Timeout Exists
-  | Unreachable Exists
-  | Cancelled (Error e)
-  | System Exists -- e.g., Out of Memory Error
+unique type Failure = { tag : Link.Type, msg : Text, payload : Any }
 
-unique type Failure = Failure Link.Type Text Any
-unique type TimeoutFailure = -- just a tag
-
-timeout : Text -> Any -> Failure
-timeout msg payload = 
-  -- `typeLink TimeoutFailure` is similar to classOf[TimeoutFailure] in Scala
-  Failure (typeLink TimeoutFailure) msg payload
-
-Remote.fail (timeout "The task timed out!" (param1, param2))
+unique ability Remote task g where
+  fail : Failure -> x
+  ...
 ```
 
-Here, we enumerate a few possible generic variants of errors, user-defined errors, errors representing canceled tasks, or system-level errors such as Out of Memory errors. 
+The `fail` operation allows failures to be triggered explicitly from user code. For example, here we define a new failure type and a convenience function for raising errors of that type within `Remote`:
 
-Another option for representing errors could be having just a single dynamically-typed error that can be dispatched upon at runtime:
+```
+unique type LoginFailure = -- empty, just using the type for its tag
 
-```haskell
-unique type Error =
-  Error (Optional Link.Type) Exists
-
--- Example: Make `Remote` concrete in the error type
-Remote.fail : Error ->{Remote loc task g} x
+loginFailure : Text -> a ->{Remote task g} x
+loginFailure msg payload = Remote.fail (Failure (typeLink LoginFailure) msg (Any payload))
 ```
 
-Given one of these basic notions of an error that could also represent a system-level error, we can go on to define combinators for nicely handling these errors.
+Various error handling functions can be written generically, for instance:
 
-```haskell
-try : '{Remote loc task err g} a 
-   ->{Remote loc task err g} Either err a
-try r = ..
+```Haskell
+-- Catch ALL errors
+try : '{Remote task g} a ->{Remote task g} Either Failure a
+try r = ...
 
-mapError : (err -> err2) 
-        -> '{Remote loc task err g} a 
-        ->{Remote loc task err g} a
-mapError f r = match try r with 
-  Left e -> Remote.fail (f e)
+-- Catch only errors of a particular type
+tryType : Link.Type -> '{Remote task g} a ->{Remote task g} Either Failure a
+tryType t r = match try r with
+  Left e -> if tag e == t then Left e else fail e
   Right a -> a
 
-rescue : '{Remote loc task err g}' a 
-      -> (err ->{Remote loc task err g} a) 
-      ->{Remote loc task err g} a
+-- Catch all errors and resume using a function `onErr`
+rescue : '{Remote task g} a
+      -> (Failure ->{Remote task g} a)
+      ->{Remote task g} a
 rescue r onErr = match try r with
   Left err -> onErr err
   Right a  -> a
 ```
 
-Here, these error-handling combinators provide different ways to do some meaningful work in the place of an error, correct an error, or otherwise handle an error.
+In addition to user defined failure types, the interpreter of `Remote` can inject infrastructure failures (like a networking failure, out of memory errors, and so on). Here are a few examples:
 
-As its name suggests `try` is intended to attempt a computation, and wrap the result in an `Either` whether it results in an error or a valid result. `rescue` takes this a step further and in the instance of an error, it attempts to perform some alternate computation and complete the function with the result of that rather than an error.
+```haskell
+-- Just empty types used as a tag
+unique type Timeout =
+
+-- The location couldn't be contacted (likely due to a networking error)
+unique type Unreachable =
+
+-- The task was explicitly cancelled
+unique type Cancelled =
+
+-- The task ran out of memory before completing
+unique type OutOfMemory =
+
+-- The task couldn't be placed at the hinted location because that location
+-- was full
+unique type LocationFull =
+
+-- etc
+```
+
+### Task trees, cancellation, and detaching
+
+```Haskell
+unique ability Remote task g where
+  fail : Failure -> x
+  cancel : Failure -> task a -> ()
+  ...
+```
+
+Tasks form a tree: a forked task can fork subtasks. When a task completes or is cancelled, all its subtasks will be cancelled if they aren't already completed.
+
+A separate function, `detachAt` has the same signature as `forkAt` but creates a task with no parent. This is sometimes useful when starting a task purely for its effects (rather than its result).
+
+```Haskell
+detachAt : Location -> '{g, Remote task g} a -> task a
+```
+
+## Augmenting `Remote` with other abilities: storage, I/O, message passing
+
+`Remote` by itself just provides task parallelism, an old and well-understood parallelization strategy. By selecting different abilities for `g` in `'{Remote task g} a`, we can describe more interesting distributed programs that use durable or ephemeral storage layers, do message passing or various forms of I/O (like issuing HTTP requests to load data from S3, say), or any combination of abilities inside the parallel tasks.
+
+As we will see in the [Examples](#examples) section later on in this document:
+
+* `Remote` with storage abilities can be used for distributed map-reduce or batch computing interfaces like RDDs in Spark.
+* `Remote` with a message passing ability can be used to implement distributed algorithms like Paxos, Raft, gossip protocols, and so on.
+
+### Durable storage
+
+Stable remote data can be represented in Unison using the `Durable` ability. The more straightforward storage API, `Durable`s are what they sound like--remote data that is expected to always be reachable.
+
+The API for the read and write portions of `Durable`s are as follows:
+
+```haskell
+unique type Durable a = { hash : Hash, location : Location }
+
+unique ability Durable.W where
+  save     : a -> Durable a
+
+unique ability Durable.R where
+  restore : Durable a -> a
+```
+
+At runtime, a `Durable a` is represented as a `Hash` and a `Location` where the value is stored.
+
+Here, the notion of *location* once again comes up in the API, and we can use chaining to provide hints to the distributed runtime about where to initially place durable data. Note that since `Durable` values are immutable and content addressed, they can be replicated to more locations beyond the location originally hinted by the programmer. Different distributed runtimes could make different choices about this.
+
+```Haskell
+t = forkAt cluster1 '(save dataset1) -- saves somewhere in cluster1
+forkAt (Durable.location (await t)) '(save dataset2) --
+```
+
+What *should* happen regarding garbage collection for `Durable`s is not yet clear. If it is determined that some sort of GCing for `Durable`s should be possible, it might result in changes to this API.
+
+#### Distributed immutable data structures
+
+Using `Durable`, one can implement distributed immutable data structures. These work much like in-memory data structures, but with regular pointers replaced with `Durable` pointers. Because these data structures are just references to immutable data stored externally, they are lightweight and can be passed between distributed tasks spawned within a `Remote` computation.
+
+To show the basic idea of constructing these data structures, here's a distributed immutable sequence type, and a function `index` for random access.
+
+```Haskell
+unique type Seq d a
+  = Empty
+  | One a
+  | Two Nat (d (Seq d a)) (d (Seq d a))
+
+size : Seq d a -> Nat
+size = cases
+  Empty -> 0
+  One _ -> 1
+  Two n _ _ -> n
+
+index : Nat -> Seq Durable a ->{Durable.R} Optional a
+index n = cases
+  Empty -> None
+  One a -> if n == 0 then Some a else None
+  Two m l r ->
+    loadedL = restore l
+    if n < size loadedL then index n loadedL
+    else index (n `drop` size loadedL) (restore r)
+```
+
+The implementation of `index` is straightforward and looks almost identical to what the code would be if all the data were in memory. The difference is just some calls to `restore` in a few places.
+
+This implementation also shows how operations on these data structures can be memory efficient as well. There's no need to load "the whole data structure" into memory to implement `index` or many other operations. Assuming the tree is balanced, only a logarithmic number of nodes in the tree get loaded into memory before locating the requested index.
+
+### Ephemeral
+
+While a `Durable` is expected to always be reachable, an `Ephemeral` is not. `Ephemeral`s are meant to be used for intermediate remote data that is not important to cache or store long-term.
+
+Similarly to the API for `Durable`s, the API for the read and write portions of `Ephemeral`s are as follows:
+
+```haskell
+unique type Ephemeral a = { hash : Hash, location : Location }
+
+unique ability Ephemeral.W where
+  save     : a -> Ephemeral a
+
+unique ability Ephemeral.R where
+  restore : Ephemeral a -> a
+```
+
+It's an identical API, and it can be used for distributed data types much like `Durable`. For instance, `Seq Ephemeral a` might be used to represent an ephemeral data set spread across the RAM of a few thousand machines.
+
+<details><summary>Again the same questions come up around garbage collection of `Ephemeral`, but they are even more pressing because `Ephemeral` will get used for temporary data structures, like heap memory in single machine programs.</summary>
+
+We discussed having a different API for `Ephemeral` in which the computation used to produce the `Ephemeral` is retained and is part of the `Ephemeral` reference itself (we retain the _lineage_ of the ephemeral data). When the `Ephemeral` is evicted from RAM or temporary storage, it can always be recomputed from the computation, and the distributed runtime can do something simple like keep an LRU cache of ephemerals. This is roughly the idea that Spark uses.
+
+The trouble with this approach is the computation needed to recreate the `Ephemeral` may be itself huge (for a deeply nested computation, common when summarizing data), and rerunning the computation may be extremely inefficient. If you have reduced a huge dataset to a much smaller summary, reproducing that work more than once can quickly grow inefficient. Especially in a general purpose distributed programming API, it becomes very easy to define computations that thrash and repeatedly evaluate costly computations.
+</details>
+
+### Message-passing layer
+
+Implementing protocols like Paxos or other distributed algorithms requires explicit messaging and coordination. For that reason, Unison will have a messaging layer that is accessible when needed. This API is rather low level and imperative, and we expect higher-level APIs will be built so developers aren't always programming with message passing directly.
+
+Like `Durable` and `Ephemeral`, this is another ability that can be used by `Remote` computations: a `'{Remote task {Messaging, Ephemeral.R}} Nat` is a distributed computation that uses message passing and reads from ephemeral storage.
+
+Here's the API:
+
+```haskell
+unique type Channel a = { id : GUID, location : Location }
+
+unique ability Messaging where
+  -- create a channel at the current location, for instance, in:
+  -- channelAtBob = forkAt bob 'channel
+  channel    : Channel a
+
+  -- Send a value to a channel; works anywhere. If the channel
+  -- resides on another node, will serialize the `a` and send it
+  -- over the network.
+  send       : a -> Channel a -> ()
+
+  -- Like `send`, but don't wait for the value to be transferred
+  -- before returning.
+  sendUnconfirmed : a -> Channel a -> ()
+
+  -- Receive a value from a channel; works anywhere. If the channel
+  -- resides on another node, the receive will happen on that node
+  -- and the result sent to the caller of `receive`.
+  receive    : Channel a -> a
+
+  -- Like `receive` but leave the value in the channel.
+  peek       : Channel a -> a
+
+  -- Like `receive`/`peek` but if the channel is currently empty,
+  -- returns `None` right away rather than blocking.
+  receiveNow : Channel a -> Optional a
+  peekNow    : Channel a -> Optional a
+```
 
 ## Distributed Runtime
 
@@ -200,23 +289,19 @@ Aspects such as identity in a running cluster (where exactly is the node identif
 
 The Distributed Unison runtime is meant to be a series of running processes on each node in a Unison cluster.
 
-### Locations
-
-As seen earlier in the APIs, Unison is meant to include with it a notion of *location* indicating where a given computation is intended to take place. Locations are meant to be a reference to some notion of compute. This notion can be fine-grained or coarse-grained. That is, location could be a reference referring to a specific node, or it can refer to a group of nodes– e.g., a pool of EC2 nodes spun up in the AWS us-east-1 availability zone.
-
-One idea that we have discussed but not yet worked out is the notion of an *algebra of locations*. This is predicated on the idea that for ephemeral data, one probably does not want to often micromanage the exact location of where a computation takes place. Rather, it might be more desirable to operate on logical groups of ephemerals under weaker constraints, such as "I don't care how the runtime does things, but try to keep these 1000 ephemerals together if you can." We don't know if an algebra of locations would be too rich/flexible, effectively making it overkill, or not. This is an idea worth exploring further.
-
 ### Scheduling
 
 How does the Unison Distributed runtime know *which* nodes are most appropriate to schedule tasks on in some pool of nodes?
 
-The Unison Distributed runtime is responsible for understanding the topology of all the locations it has access to. As the Unison Distribute runtime is a running process on all Unison nodes, it keeps track of which node it is running on, and the location of its neighbors. Using pings, it may even be possible to work out which nodes are near (or, quicker to reach) or far (or, slower to reach). 
+The Unison Distributed runtime is responsible for understanding the topology of all the locations it has access to. As the Unison Distribute runtime is a running process on all Unison nodes, it keeps track of which node it is running on, and the location of its neighbors. Using pings, it may even be possible to work out which nodes are near (or, quicker to reach) or far (or, slower to reach).
 
 With such bookkeeping in place, it would then be possible to expose an API for this notion of near vs far (quickness/slowness to reply), and programmers could write libraries that can take advantage of locality. This would effectively give programmers a hook to avoid stragglers for latency-sensitive tasks. And if there is ever to be an algebra of locations, this near vs far (quick vs slow) could even be worked into the algebra of locations.
 
 Ask nodes to run a short computation occasionally to benchmark it in order to determine how overloaded (or not) a node in the system is.
 
 ## Examples
+
+We still gotta fill these in.
 
 ### Spark
 
@@ -226,11 +311,26 @@ Ask nodes to run a short computation occasionally to benchmark it in order to de
 
 ### Mutual Exclusion
 
-### Gossip something
-
-CRDT
+### Gossip
 
 ## Open Questions
 
-- GC of Durable and Ephemeral nodes
-- Cancellation of lineages
+Discuss approach to garbage collection
+
+## Other ideas considered
+
+Reader-style "current region", useful for implementing `fork` where you really don't care where the task gets scheduled, and you don't feel like plumbing "the current region" around everwhere.
+
+Also resource limits when forking tasks. Again, reader-style, lexically scoped.
+
+```Haskell
+unique ability Remote task g where
+  ...
+  -- A default location, useful for
+  region   : Location
+
+  -- The default limits on RAM, CPU, etc
+  limits   : Limits
+
+unique type Limits = { ram : RAM, cpuPercent : Percent, cpuTime : Duration }
+```
