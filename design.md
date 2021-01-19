@@ -25,9 +25,9 @@ unique ability Remote task g where
 
 The `Remote` ability is parameterized on `task`, which is the representation of a running computation, and `g` which controls what abilities forked computations can access. For example:
 
-* A computation `'{Remote task, {}} Nat` can only do pure computation
+* A computation `'{Remote task, {}} Nat` can only do pure computation.
 * A computation `'{Remote task, Http.Client} ()` will have access to an `Http.Client` ability.
-* In theory, a '{Remote task, IO} a` could exist in which remote computations can do arbitrary `IO`, but in practice, on real distributed infrastructure, we'll use more restricted abilities than `IO`.
+* In theory, a `'{Remote task, IO} a` could exist in which remote computations can do arbitrary `IO`, but in practice, on real distributed infrastructure, we'll use more restricted abilities than `IO`.
 
 The primary function that provides for distributed parallelism is `forkAt`, which starts a computation running at a (possibly remote) location. Here's an example usage:
 
