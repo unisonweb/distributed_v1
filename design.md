@@ -63,7 +63,7 @@ Here, `t2` and `merged` are both forked at the same location as `t1`, so no netw
 
 <details><summary>
 The above API lets you be explicit about where tasks are forked. One idea that we have discussed is the notion of an *algebra of locations* that makes it possible to be less explicit about locations while still expressing interesting constraints.</summary>
-
+<br/>
 For instance, it might be desirable to be able to say things like `forkAt (somewhereNear bob) thing1`, or `forkAt (both (within usEast) (farFrom bob)) thing2` for a location that's in `usEast` but isn't on the same machine as the location `bob`. This sort of thing might be used to obtain locations whose failures will be less correlated than if they are on the same machine. We don't know if an algebra of locations would be too rich/flexible, effectively making it overkill, or not. This is an idea worth exploring further.
 </details>
 
@@ -167,11 +167,22 @@ The API for the read and write portions of `Durable`s are as follows:
 ```haskell
 unique type Durable a = { hash : Hash, location : Location }
 
+unique type RefreshRate = { seconds : Nat, backoffLimit : Optional Nat }
+
 unique ability Durable.W where
-  save     : a -> Durable a
+  save : a -> Durable a
+
+  -- Data not accessed at least this often may be deleted by storage layer
+  -- or moved to archival storage. See later discussion on GC.
+  refreshRate : RefreshRate
 
 unique ability Durable.R where
   restore : Durable a -> a
+
+  -- Refresh a reference without loading it. Returns `false` if the reference
+  -- can't be found in the storage layer. Rarely used but sometimes useful.
+  -- See GC discussion below.
+  refresh : Durable a -> Boolean
 ```
 
 At runtime, a `Durable a` is represented as a `Hash` and a `Location` where the value is stored.
@@ -217,7 +228,7 @@ The implementation of `index` is straightforward and looks almost identical to w
 
 This implementation also shows how operations on these data structures can be memory efficient as well. There's no need to load "the whole data structure" into memory to implement `index` or many other operations. Assuming the tree is balanced, only a logarithmic number of nodes in the tree get loaded into memory before locating the requested index.
 
-### Ephemeral
+### Ephemeral storage
 
 While a `Durable` is expected to always be reachable, an `Ephemeral` is not. `Ephemeral`s are meant to be used for intermediate remote data that is not important to cache or store long-term.
 
@@ -229,18 +240,46 @@ unique type Ephemeral a = { hash : Hash, location : Location }
 unique ability Ephemeral.W where
   save     : a -> Ephemeral a
 
+  -- Data not accessed at least this often may be deleted by storage layer
+  -- or moved to archival storage. See later discussion on GC.
+  refreshRate : RefreshRate
+
 unique ability Ephemeral.R where
   restore : Ephemeral a -> a
+
+  -- Refresh a reference without loading it. Returns `false` if the reference
+  -- can't be found in the storage layer. Rarely used by sometimes useful.
+  refresh : Durable a -> Boolean
 ```
 
 It's an identical API, and it can be used for distributed data types much like `Durable`. For instance, `Seq Ephemeral a` might be used to represent an ephemeral data set spread across the RAM of a few thousand machines.
 
 <details><summary>Again the same questions come up around garbage collection of `Ephemeral`, but they are even more pressing because `Ephemeral` will get used for temporary data structures, like heap memory in single machine programs.</summary>
-
-We discussed having a different API for `Ephemeral` in which the computation used to produce the `Ephemeral` is retained and is part of the `Ephemeral` reference itself (we retain the _lineage_ of the ephemeral data). When the `Ephemeral` is evicted from RAM or temporary storage, it can always be recomputed from the computation, and the distributed runtime can do something simple like keep an LRU cache of ephemerals. This is roughly the idea that Spark uses.
+<br/>
+We discussed having a different API for `Ephemeral` in which the computation used to produce the `Ephemeral` is retained and is part of the `Ephemeral` reference itself (we retain the _lineage_ of the ephemeral data). When the `Ephemeral` is evicted from RAM or temporary storage, it can always be recomputed from the computation, and the distributed runtime can do something simple like keep an LRU cache of ephemerals.
 
 The trouble with this approach is the computation needed to recreate the `Ephemeral` may be itself huge (for a deeply nested computation, common when summarizing data), and rerunning the computation may be extremely inefficient. If you have reduced a huge dataset to a much smaller summary, reproducing that work more than once can quickly grow inefficient. Especially in a general purpose distributed programming API, it becomes very easy to define computations that thrash and repeatedly evaluate costly computations.
 </details>
+
+### Garbage collection of `Durable` and `Ephemeral`
+
+In a distributed setting, heartbeats are often used for garbage collection: a node using some external resource keeps that resource alive by sending the node(s) hosting the resource regular hearbeats. If the user node is hit by an asteroid, it stops sending heartbeats, and if there are no other users of the resource sending heartbeats, the resource knows to delete itself. (Explicit deallocation or referencing counting is problematic, because the node using the resource can get hit by an asteroid before it gets to deallocate or decrement the reference count.)
+
+While this concept is straighforward, and `Durable` and `Ephemeral` references ("storage references") each have a `refreshRate` operation to control how often data should be refreshed or read before deallocation, implementing it naively could involve lots of network communication. These storage references are extremely fine-grained: data structures like distributed sequences, maps, and so on will often be composed of trees of storage references with potentially trillions of branches. We want this flexibility of the storage API being capable of expressing any data structure, but it would be inefficient if every node in a large data structure is sending separate heartbeats to the storage layer.
+
+The solution involves a few different pieces:
+
+* If a storage reference is live, each of its dependencies should be considered live as well. This avoids needing to traverse an entire huge data structure to send heartbeats for all its constituent storage references. Instead, merely keeping the root of the structure live is enough to retain all its descendents.
+* Reading an `Ephemeral` or a `Durable` storage reference counts as a heartbeat. This avoids needing separate network communication apart from the code that reads the reference, which will often already involve network communication if the data isn't cached.
+* The distributed runtime can employ exponential backoff of refresh rate, so that long-lived storage references only require a logarithmic number of heartbeats.
+  * For instance, an initial refresh rate of every 10 minutes may be increased to 20 minutes, 40 minutes, and so on, up to some (optional) limit. The reduces the amount of network communication especially when storage references can be found in a local cache.
+  * This approach means deallocation may be less timely than otherwise. For instance, if the refresh rate is doubled as part of the backoff process, a storage reference that is no longer live as of time _t_ may kept around until time _2t_. So for things like GDPR-compliant storage where there is a [Right to Erasure](https://www.threatstack.com/blog/gdpr-what-is-the-right-to-erasure#:~:text=Under%20Article%2012.3%20of%20the,the%20complexity%20of%20the%20request.) that requires that certain data be deleted within 30 days, the user may allow for some backoff of the refresh rate but supply a limit of 30 days.
+
+A few more notes about this API:
+
+* It's possible for a distributed runtime to establish other GC roots besides just storage references that have been accessed recently. For instance, the system might have a general concept of a running job and consider the output of a job to be a GC root, and any transitive dependencies of that output may be considered live by a runtime.
+* It's possible to use this API to create lexically scoped references that are guaranteed to remain alive for the duration of a task and be deallocated when some lexical scope finishes. The general idea is spawn a subtask that issues periodic keepalives (with an initially small refresh rate, like every 20 seconds) to the referenced data, and then have that subtask terminate when the overall task completes.
+  * We can even use the typechecker to that such references don't escape some lexical scope (see [this comment on how](https://github.com/unisonweb/unison/issues/798#issuecomment-702487151) which is a similar idea to the `ST` type in Haskell).
 
 ### Message-passing layer
 
@@ -301,19 +340,14 @@ Ask nodes to run a short computation occasionally to benchmark it in order to de
 
 ## Examples
 
-We still gotta fill these in.
+We're planning on showing some short examples of using these APIs to program a variety of distributed programs. Some ideas for examples:
 
-### Spark
-
-### Message-Passing (Ping Pong)
-
-### Consensus: Paxos (conceptual)
-
-### Mutual Exclusion
-
-### Gossip
-
-## Open Questions
+* Distributed map reduce
+* A Spark-like library
+* Simple ping-pong message passing example
+* Toy implementation of Paxos
+* Distributed mutex
+* Gossip protocol
 
 Discuss approach to garbage collection
 
@@ -321,7 +355,7 @@ Discuss approach to garbage collection
 
 Reader-style "current region", useful for implementing `fork` where you really don't care where the task gets scheduled, and you don't feel like plumbing "the current region" around everwhere.
 
-Also resource limits when forking tasks. Again, reader-style, lexically scoped.
+Also resource limits when forking tasks. Again, reader-style, lexically scoped:
 
 ```Haskell
 unique ability Remote task g where
