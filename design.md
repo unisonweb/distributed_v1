@@ -230,9 +230,9 @@ This implementation also shows how operations on these data structures can be me
 
 ### Ephemeral storage
 
-While a `Durable` is expected to always be reachable, an `Ephemeral` is not. `Ephemeral`s are meant to be used for intermediate remote data that is not important to cache or store long-term.
+While a `Durable` is expected to always be reachable, an `Ephemeral` is not. `Ephemeral`s are meant to be used for intermediate remote data that is not important to cache or store long-term. It would typically be stored in RAM and swapped to durable storage only if needed.
 
-Similarly to the API for `Durable`s, the API for the read and write portions of `Ephemeral`s are as follows:
+The API is basically identical to `Durable`:
 
 ```haskell
 unique type Ephemeral a = { hash : Hash, location : Location }
@@ -252,7 +252,7 @@ unique ability Ephemeral.R where
   refresh : Durable a -> Boolean
 ```
 
-It's an identical API, and it can be used for distributed data types much like `Durable`. For instance, `Seq Ephemeral a` might be used to represent an ephemeral data set spread across the RAM of a few thousand machines.
+This can be used for distributed data types much like `Durable`. For instance, `Seq Ephemeral a` might be used to represent an ephemeral data set spread across the RAM of a few thousand machines.
 
 <details><summary>Again the same questions come up around garbage collection of `Ephemeral`, but they are even more pressing because `Ephemeral` will get used for temporary data structures, like heap memory in single machine programs.</summary>
 <br/>
