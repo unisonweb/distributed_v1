@@ -10,7 +10,9 @@ The API is given using [abilities](https://unisonweb.org/docs/abilities), which 
 
 ## Remote
 
-Unison's main API for writing distributed programs is the `Remote` ability, which supports forking parallel computations at different logical locations. Forking returns a handle to a running task, and `await t` blocks the current computation until the task `t` completes with its result. This is much the same as other asynchronous programming APIs, except that tasks now have a location. Here's the full API, which will be explained in more detail:
+Unison's main API for writing distributed programs is the `Remote` ability, which supports forking parallel computations at different logical locations. Forking returns a handle to a running task, and `await t` blocks the current computation until the task `t` completes with its result. The Unison runtime has lightweight threads that are decoupled from OS threads, so many Unison threads may be mapped by the runtime to the same OS thread.
+
+The `forkAt`/`await` API is much the same as other asynchronous programming APIs, except that tasks now have a location (locations are essentially GUIDs, more on that below). Here's the full API, which will be explained in more detail:
 
 ```Haskell
 unique ability Remote task g where
@@ -62,14 +64,14 @@ merged = forkAt (location t1) '(merge (await t1) (await t2))
 Here, `t2` and `merged` are both forked at the same location as `t1`, so no network communication happens to combine their results.
 
 <details><summary>
-The above API lets you be explicit about where tasks are forked. One idea that we have discussed is the notion of an *algebra of locations* that makes it possible to be less explicit about locations while still expressing interesting constraints.</summary>
+The above API lets you be explicit about where tasks are forked. One idea that we have discussed is the notion of an <i>algebra of locations</i> that makes it possible to be less explicit about locations while still expressing interesting constraints.</summary>
 <br/>
-For instance, it might be desirable to be able to say things like `forkAt (somewhereNear bob) thing1`, or `forkAt (both (within usEast) (farFrom bob)) thing2` for a location that's in `usEast` but isn't on the same machine as the location `bob`. This sort of thing might be used to obtain locations whose failures will be less correlated than if they are on the same machine. We don't know if an algebra of locations would be too rich/flexible, effectively making it overkill, or not. This is an idea worth exploring further.
+For instance, it might be desirable to be able to say things like <code>forkAt (somewhereNear bob) thing1</code>, or <code>forkAt (both (within usEast) (farFrom bob)) thing2</code> for a location that's in `usEast` but isn't on the same machine as the location `bob`. This sort of thing might be used to obtain locations whose failures will be less correlated than if they are on the same machine. We don't know if an algebra of locations would be too rich/flexible, effectively making it overkill, or not. This is an idea worth exploring further.
 </details>
 
 ### Error handling
 
-Tasks (especially remote tasks) can fail. We use a common failure type with runtime type tags so users can define new failure types:
+Tasks (especially remote tasks) can fail. We use a common failure type with runtime type tags so users can define new kinds of failure:
 
 ```haskell
 unique type Failure = { tag : Link.Type, msg : Text, payload : Any }
@@ -81,7 +83,7 @@ unique ability Remote task g where
 
 The `fail` operation allows failures to be triggered explicitly from user code. For example, here we define a new failure type and a convenience function for raising errors of that type within `Remote`:
 
-```
+```Haskell
 unique type LoginFailure = -- empty, just using the type for its tag
 
 loginFailure : Text -> a ->{Remote task g} x
@@ -110,7 +112,7 @@ rescue r onErr = match try r with
   Right a  -> a
 ```
 
-In addition to user defined failure types, the interpreter of `Remote` can inject infrastructure failures (like a networking failure, out of memory errors, and so on). Here are a few examples:
+In addition to user defined failure types, the interpreter of `Remote` can inject infrastructure failures (like a networking failure, out of memory errors, and so on). Here's a sketch of a few kinds of errors that the distributed runtime might inject:
 
 ```haskell
 -- Just empty types used as a tag
@@ -141,7 +143,17 @@ unique ability Remote task g where
   ...
 ```
 
-Tasks form a tree: a forked task can fork subtasks. When a task completes or is cancelled, all its subtasks will be cancelled if they aren't already completed.
+Tasks form a tree: a forked task can fork subtasks. When a task completes or is cancelled, all its subtasks will be cancelled if they aren't already completed. For example, in this code:
+
+```Haskell
+ex1 : Nat ->{Remote task Http} task Nat
+ex1 n = forkAt usEast 'let
+  t1 = forkAt usEast '(thing1 n "https://example.com")
+  t2 = forkAt usEast '(thing2 n "https://google.com")
+  await t2
+```
+
+The `t1` task will be actively cancelled (if it isn't already completed) when the `ex1` task completes (or is cancelled).
 
 A separate function, `detachAt` has the same signature as `forkAt` but creates a task with no parent. This is sometimes useful when starting a task purely for its effects (rather than its result).
 
@@ -160,13 +172,14 @@ As we will see in the [Examples](#examples) section later on in this document:
 
 ### Durable storage
 
-Stable remote data can be represented in Unison using the `Durable` ability. The more straightforward storage API, `Durable`s are what they sound like--remote data that is expected to always be reachable.
+Stable remote data can be represented in Unison using the `Durable` ability. `Durable`s are what they sound like--remote data that is expected to always be reachable.
 
 The API for the read and write portions of `Durable`s are as follows:
 
 ```haskell
 unique type Durable a = { hash : Hash, location : Location }
 
+-- Discussed below
 unique type RefreshRate = { seconds : Nat, backoffLimit : Optional Nat }
 
 unique ability Durable.W where
@@ -187,14 +200,14 @@ unique ability Durable.R where
 
 At runtime, a `Durable a` is represented as a `Hash` and a `Location` where the value is stored.
 
-Here, the notion of *location* once again comes up in the API, and we can use chaining to provide hints to the distributed runtime about where to initially place durable data. Note that since `Durable` values are immutable and content addressed, they can be replicated to more locations beyond the location originally hinted by the programmer. Different distributed runtimes could make different choices about this.
+Here, the notion of *location* once again comes up in the API, and we can use chaining to provide hints to the distributed runtime about where to initially place or cache durable data. Note that since `Durable` values are immutable and content addressed, they can be replicated to more locations beyond the location originally hinted by the programmer. Different distributed runtimes could make different choices about this.
 
 ```Haskell
 t = forkAt cluster1 '(save dataset1) -- saves somewhere in cluster1
-forkAt (Durable.location (await t)) '(save dataset2) --
+forkAt (Durable.location (await t)) '(save dataset2) -- saves at the task `t`
 ```
 
-What *should* happen regarding garbage collection for `Durable`s is not yet clear. If it is determined that some sort of GCing for `Durable`s should be possible, it might result in changes to this API.
+There's discussion of garbage collection of `Durable`s below.
 
 #### Distributed immutable data structures
 
@@ -254,12 +267,10 @@ unique ability Ephemeral.R where
 
 This can be used for distributed data types much like `Durable`. For instance, `Seq Ephemeral a` might be used to represent an ephemeral data set spread across the RAM of a few thousand machines.
 
-<details><summary>Again the same questions come up around garbage collection of `Ephemeral`, but they are even more pressing because `Ephemeral` will get used for temporary data structures, like heap memory in single machine programs.</summary>
-<br/>
-We discussed having a different API for `Ephemeral` in which the computation used to produce the `Ephemeral` is retained and is part of the `Ephemeral` reference itself (we retain the _lineage_ of the ephemeral data). When the `Ephemeral` is evicted from RAM or temporary storage, it can always be recomputed from the computation, and the distributed runtime can do something simple like keep an LRU cache of ephemerals.
+Some question we are actively discussing/working out:
 
-The trouble with this approach is the computation needed to recreate the `Ephemeral` may be itself huge (for a deeply nested computation, common when summarizing data), and rerunning the computation may be extremely inefficient. If you have reduced a huge dataset to a much smaller summary, reproducing that work more than once can quickly grow inefficient. Especially in a general purpose distributed programming API, it becomes very easy to define computations that thrash and repeatedly evaluate costly computations.
-</details>
+* Again the same questions come up around garbage collection of `Ephemeral`, but they are even more pressing because `Ephemeral` will get used for temporary data structures, like heap memory in single machine programs.
+* Possible fault tolerance of `Ephemeral` values.
 
 ### Garbage collection of `Durable` and `Ephemeral`
 
@@ -275,7 +286,7 @@ The solution involves a few different pieces:
   * For instance, an initial refresh rate of every 10 minutes may be increased to 20 minutes, 40 minutes, and so on, up to some (optional) limit. The reduces the amount of network communication especially when storage references can be found in a local cache.
   * This approach means deallocation may be less timely than otherwise. For instance, if the refresh rate is doubled as part of the backoff process, a storage reference that is no longer live as of time _t_ may kept around until time _2t_. So for things like GDPR-compliant storage where there is a [Right to Erasure](https://www.threatstack.com/blog/gdpr-what-is-the-right-to-erasure#:~:text=Under%20Article%2012.3%20of%20the,the%20complexity%20of%20the%20request.) that requires that certain data be deleted within 30 days, the user may allow for some backoff of the refresh rate but supply a limit of 30 days.
 
-A few more notes about this API:
+Some additional miscellaneous notes about this API:
 
 * It's possible for a distributed runtime to establish other GC roots besides just storage references that have been accessed recently. For instance, the system might have a general concept of a running job and consider the output of a job to be a GC root, and any transitive dependencies of that output may be considered live by a runtime.
 * It's possible to use this API to create lexically scoped references that are guaranteed to remain alive for the duration of a task and be deallocated when some lexical scope finishes. The general idea is spawn a subtask that issues periodic keepalives (with an initially small refresh rate, like every 20 seconds) to the referenced data, and then have that subtask terminate when the overall task completes.
@@ -336,8 +347,6 @@ The Unison Distributed runtime is responsible for understanding the topology of 
 
 With such bookkeeping in place, it would then be possible to expose an API for this notion of near vs far (quickness/slowness to reply), and programmers could write libraries that can take advantage of locality. This would effectively give programmers a hook to avoid stragglers for latency-sensitive tasks. And if there is ever to be an algebra of locations, this near vs far (quick vs slow) could even be worked into the algebra of locations.
 
-Ask nodes to run a short computation occasionally to benchmark it in order to determine how overloaded (or not) a node in the system is.
-
 ## Examples
 
 We're planning on showing some short examples of using these APIs to program a variety of distributed programs. Some ideas for examples:
@@ -349,22 +358,4 @@ We're planning on showing some short examples of using these APIs to program a v
 * Distributed mutex
 * Gossip protocol
 
-Discuss approach to garbage collection
-
-## Other ideas considered
-
-Reader-style "current region", useful for implementing `fork` where you really don't care where the task gets scheduled, and you don't feel like plumbing "the current region" around everwhere.
-
-Also resource limits when forking tasks. Again, reader-style, lexically scoped:
-
-```Haskell
-unique ability Remote task g where
-  ...
-  -- A default location, useful for
-  region   : Location
-
-  -- The default limits on RAM, CPU, etc
-  limits   : Limits
-
-unique type Limits = { ram : RAM, cpuPercent : Percent, cpuTime : Duration }
-```
+In a subsequent document, we intend to work out some or all of these examples to help illustrate how these APIs could be used for different sorts of applications.
