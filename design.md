@@ -153,13 +153,25 @@ ex1 n = forkAt usEast 'let
   await t2
 ```
 
-The `t1` task will be actively cancelled (if it isn't already completed) when the `ex1` task completes (or is cancelled).
+The `t1` task will be actively cancelled (if it isn't already completed) when the `ex1` task completes (or is cancelled). 
 
 A separate function, `detachAt` has the same signature as `forkAt` but creates a task with no parent. This is sometimes useful when starting a task purely for its effects (rather than its result).
 
 ```Haskell
 detachAt : Location -> '{g, Remote task g} a -> task a
 ```
+
+Since `forkAt`-based tasks are organized as trees, they can't really meaningfully return uncompleted subtasks as part of their result, since those will be terminated when the parent task finishes. For instance, consider: 
+
+```Haskell
+ex1 _ = 
+  t1 = forkAt loc1 'let
+    t2 = forkAt loc1 blah
+    t2
+  await (await t1)
+```
+
+Here, `t1` immediately returns the `t2` task (without waiting for its completion) and when `t1` completes, it immediately cancels any running subtasks, which likely includes `t2`. Correct usage of tasks is to `await` their results.
 
 ## Augmenting `Remote` with other abilities: storage, I/O, message passing
 
@@ -301,25 +313,20 @@ Like `Durable` and `Ephemeral`, this is another ability that can be used by `Rem
 Here's the API:
 
 ```haskell
-unique type Channel a = { id : GUID, location : Location }
+unique type Channel a = { id : GUID }
 
 unique ability Messaging where
-  -- create a channel at the current location, for instance, in:
-  -- channelAtBob = forkAt bob 'channel
+  -- create a channel, which is just a GUID
   channel    : Channel a
 
-  -- Send a value to a channel; works anywhere. If the channel
-  -- resides on another node, will serialize the `a` and send it
-  -- over the network.
-  send       : a -> Channel a -> ()
+  -- Send a value to a channel
+  sendAt     : a -> Location -> Channel a -> ()
 
-  -- Like `send`, but don't wait for the value to be transferred
+  -- Like `sendAt`, but don't wait for the value to be transferred
   -- before returning.
-  sendUnconfirmed : a -> Channel a -> ()
+  sendUnconfirmedAt : a -> Channel a -> ()
 
-  -- Receive a value from a channel; works anywhere. If the channel
-  -- resides on another node, the receive will happen on that node
-  -- and the result sent to the caller of `receive`.
+  -- Receive a value from a channel at the current location.
   receive    : Channel a -> a
 
   -- Like `receive` but leave the value in the channel.
@@ -329,7 +336,21 @@ unique ability Messaging where
   -- returns `None` right away rather than blocking.
   receiveNow : Channel a -> Optional a
   peekNow    : Channel a -> Optional a
+  
+  -- Ask for the current number of values enqueued for this channel
+  -- at the current location
+  size : Channel a -> Nat
+  
+  -- Clear a channel of any enqueued messages at the current location
+  clear : Channel a -> ()
 ```
+
+Channels are just GUIDs, with associated message queues at each node which spring into existence when a message is first received. A question is what should happen to values sent to a channel that has no listeners. The proposed behavior is that values sent to a queue which has no receivers are enqueued for a small period of time (say 10 seconds), then discarded. Correct usage of channels will have a receiver running in a loop at each location where the channel is active. Higher-level protocols can be implemented atop these semantics.
+
+Other alternatives are:
+
+* The values are enqueued indefinitely until someone receives from or clears the queue. These semantics are prone to memory leaks.
+* The values are enqueued as long as an active task at the location still references the channel. These might be the nicest semantics but would require special runtime support. It's also arguably a bit weird that merely referencing a channel but never again receiving from it still results in the runtime retaining all values sent to that channel.
 
 ## Distributed Runtime
 
@@ -359,3 +380,12 @@ We're planning on showing some short examples of using these APIs to program a v
 * Gossip protocol
 
 In a subsequent document, we intend to work out some or all of these examples to help illustrate how these APIs could be used for different sorts of applications.
+
+## FAQ
+
+### How are tasks garbage collected and what happens when `await t` is called on a task that completed long ago?
+
+The location that computes a task will hold onto the result until the parent task is completed (possibly with a failure) or cancelled. Cancelling a task `t` forked at location `loc` allows `t` to be garbage collected after notifying any other tasks of the cancellation. Thus tasks that call `await t` after the cancellation may just get a `TaskNotFound` failure. A `TaskNotFound` might also occur if a location gets rebooted and has its ephemeral state destroyed.
+
+More sophisticated supervision can be implemented on top of this API (for instance, one might define a version of `forkAt` which cancels tasks after a while if they aren't making sufficient progress, or which cancels tasks shortly after completion to allow for reclaimation).
+
