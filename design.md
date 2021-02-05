@@ -341,11 +341,14 @@ unique ability Messaging where
   -- at the current location
   size : Channel a -> Nat
   
+  -- 
+  nonce : Channel a -> Nat
+  
   -- Clear a channel of any enqueued messages at the current location
   clear : Channel a -> ()
 ```
 
-Channels are just GUIDs, with associated message queues at each node which spring into existence when a message is first received. A question is what should happen to values sent to a channel that has no listeners. The proposed behavior is that values sent to a queue which has no receivers are enqueued for a small period of time (say 10 seconds), then discarded. Correct usage of channels will have a receiver running in a loop at each location where the channel is active. Higher-level protocols can be implemented atop these semantics.
+Channels are just GUIDs, with associated message queues at each node which spring into existence when a message is first received. A question is what should happen to values sent to a channel that has no receivers. The proposed behavior is that values sent to a channel which has no receivers are enqueued for a small period of time (say 10 seconds), then discarded. Correct usage of channels will have a receiver running in a loop at each location where the channel is active. Higher-level protocols can be implemented atop these semantics (for instance, a producer might ask a consumer to notify it when it processes messages sent to a channel, and react in some way if messages go unprocessed after a period of time).
 
 Other alternatives are:
 
