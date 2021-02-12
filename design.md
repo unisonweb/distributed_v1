@@ -313,18 +313,26 @@ Like `Durable` and `Ephemeral`, this is another ability that can be used by `Rem
 Here's the API:
 
 ```haskell
-unique type Channel a = { id : GUID }
+unique type Channel a = { id : GUID, location : Location }
 
 unique ability Messaging where
-  -- create a channel, which is just a GUID
-  channel    : Channel a
+  
+  -- create a channel at the current location
+  channel : Channel.Id a -> Channel a
+  
+  -- (not sure of usefulness) 
+  -- create a channel at the current location, using the GUID from the provided channel 
+  copy : Channel a -> Channel a 
+  
+  -- close the channel; subsequent sends/receives from the channel will fail 
+  close : Channel a -> ()
 
   -- Send a value to a channel
-  sendAt     : a -> Location -> Channel a -> ()
+  send : a -> Channel a -> ()
 
-  -- Like `sendAt`, but don't wait for the value to be transferred
+  -- Like `send`, but don't wait for the value to be transferred
   -- before returning.
-  sendUnconfirmedAt : a -> Channel a -> ()
+  sendUnconfirmed : a -> Channel a -> ()
 
   -- Receive a value from a channel at the current location.
   receive    : Channel a -> a
@@ -338,22 +346,18 @@ unique ability Messaging where
   peekNow    : Channel a -> Optional a
   
   -- Ask for the current number of values enqueued for this channel
-  -- at the current location
   size : Channel a -> Nat
   
-  -- 
+  -- Channel nonce, incremented after each receive
   nonce : Channel a -> Nat
   
-  -- Clear a channel of any enqueued messages at the current location
+  -- Clear a channel of any enqueued messages
   clear : Channel a -> ()
 ```
 
-Channels are just GUIDs, with associated message queues at each node which spring into existence when a message is first received. A question is what should happen to values sent to a channel that has no receivers. The proposed behavior is that values sent to a channel which has no receivers are enqueued for a small period of time (say 10 seconds), then discarded. Correct usage of channels will have a receiver running in a loop at each location where the channel is active. Higher-level protocols can be implemented atop these semantics (for instance, a producer might ask a consumer to notify it when it processes messages sent to a channel, and react in some way if messages go unprocessed after a period of time).
+Channels are just GUIDs with an associated location. Each location that supports `Messaging` will have something like a `Map ChannelId Queue`. When a channel is created, it will add to this map, and when a channel `c` is closed it will delete the key `c` from the map. When a location receives a message for a channel it doesn't know about, it reports an error to the sender. Programs are responsible for cleaning up channels after usage.
 
-Other alternatives are:
-
-* The values are enqueued indefinitely until someone receives from or clears the queue. These semantics are prone to memory leaks.
-* The values are enqueued as long as an active task at the location still references the channel. These might be the nicest semantics but would require special runtime support. It's also arguably a bit weird that merely referencing a channel but never again receiving from it still results in the runtime retaining all values sent to that channel.
+Other APIs can be built on top of this one (for instance, channels that are closed automatically after some period of inactivity).
 
 ## Distributed Runtime
 
