@@ -318,7 +318,7 @@ unique type Channel a = { id : GUID, location : Location }
 unique ability Messaging where
   
   -- create a channel at the current location
-  channel : Channel.Id a -> Channel a
+  channel : Channel a
   
   -- (not sure of usefulness) 
   -- create a channel at the current location, using the GUID from the provided channel 
